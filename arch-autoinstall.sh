@@ -1,160 +1,201 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  arch-autoinstall.sh  (bare-metal, UEFI, fully automated)
-#  Run from the Arch Linux live ISO as root.
+#  arch-autoinstall.sh  —  bare-metal, UEFI, fully automated
+#  Boot the Arch Linux live ISO, then run:  bash arch-autoinstall.sh
 #
-#  - Wipes + partitions the target disk (GPT: 1G EFI + ext4 root)
-#  - Installs base system via archinstall (pacstrap fallback)
-#  - root / 1234   and   ethan / 1234 (sudo, passwordless sudo)
-#  - Installs git
-#  - Reboots into the installed system
+#  What it does:
+#    1. Auto-detects your disk (sda / nvme0n1 / etc.)
+#    2. Wipes it, creates GPT: 1 GB EFI  +  rest ext4 root
+#    3. pacstrap base system + git and essentials
+#    4. Configures locale, timezone, hostname, bootloader (GRUB UEFI)
+#    5. Creates user ethan (passwordless sudo) and sets passwords
+#    6. Enables NetworkManager + sshd
+#    7. Reboots into the installed system
 # =============================================================================
 set -euo pipefail
 
-# ----------------------------- settings --------------------------------------
+# ─────────────────────────── settings ────────────────────────────────────────
 USERNAME="ethan"
 USER_PASS="1234"
 ROOT_PASS="1234"
 HOSTNAME="archlinux"
 TIMEZONE="America/Indianapolis"
-PKGS="base-devel git vim nano htop wget curl openssh networkmanager sudo efibootmgr"
+LOCALE="en_US.UTF-8"
+KEYMAP="us"
 
-MNT=/mnt/archinstall
-# -----------------------------------------------------------------------------
+BASE_PKGS=(
+  base base-devel linux linux-firmware
+  grub efibootmgr
+  networkmanager openssh
+  sudo git vim nano htop wget curl
+)
 
-log() { printf '\e[1;35m==>\e[0m %s\n' "$*"; }
-die() { printf '\e[1;31m!!\e[0m %s\n' "$*" >&2; exit 1; }
+MNT=/mnt/arch
+# ─────────────────────────────────────────────────────────────────────────────
 
-[[ $EUID -eq 0 ]] || die "Run as root from the Arch live ISO."
+log() { printf '\n\e[1;35m==> %s\e[0m\n' "$*"; }
+die() { printf '\n\e[1;31m!! %s\e[0m\n' "$*" >&2; exit 1; }
 
-exec > >(tee -a /root/autoinstall.log > /dev/console) 2>&1
-set -x
+[[ $EUID -eq 0 ]] || die "Must run as root."
 
-log "##### Arch auto-install starting #####"
+# ── log everything to file and console ───────────────────────────────────────
+exec > >(tee /root/autoinstall.log) 2>&1
 
-# ---- pick target disk ----
+# ── pick target disk ─────────────────────────────────────────────────────────
+log "Detecting disk"
 DISK=$(lsblk -dpno NAME,TYPE,RO,RM \
-       | awk '$2=="disk" && $3==0 && $4==0 && $1 !~ /loop|sr|zram/ {print $1; exit}')
-[[ -b "$DISK" ]] || { log "No target disk found"; lsblk; exit 1; }
-[[ "$DISK" =~ (nvme|mmcblk) ]] && P="${DISK}p" || P="$DISK"
+  | awk '$2=="disk" && $3=="0" && $4=="0" && $1 !~ /loop|sr|zram/ {print $1; exit}')
+[[ -b "$DISK" ]] || die "No suitable disk found — check: lsblk"
 log "Target disk: $DISK"
+lsblk "$DISK"
 
-log "Starting in 10s — Ctrl+C to abort"
-for i in 10 9 8 7 6 5 4 3 2 1; do printf '\r%2s...' "$i"; sleep 1; done; echo
+# ── 10 s abort window ────────────────────────────────────────────────────────
+echo ""
+printf '\e[1;31mWARNING: %s will be completely wiped.\e[0m\n' "$DISK"
+for i in 10 9 8 7 6 5 4 3 2 1; do
+  printf '\rStarting in %d s — Ctrl+C to abort ... ' "$i"; sleep 1
+done
+echo ""
 
-# ---- network, keyring, clock ----
-log "Waiting for network"
-for i in $(seq 1 60); do ping -c1 -W2 archlinux.org &>/dev/null && break; sleep 5; done
-for i in $(seq 1 100); do systemctl is-active --quiet pacman-init.service && break; sleep 3; done
+# ── sync clock ───────────────────────────────────────────────────────────────
+log "Syncing clock"
 timedatectl set-ntp true
-pacman -Sy --noconfirm archlinux-keyring archinstall || true
 
-# ---- wipe + partition ----
-log "Partitioning $DISK"
+# ── wait for pacman-init (keyring) ───────────────────────────────────────────
+log "Waiting for pacman keyring init"
+for i in $(seq 1 60); do
+  systemctl is-active --quiet pacman-init.service && break
+  sleep 3
+done
+
+# ── update package databases ─────────────────────────────────────────────────
+log "Updating package databases"
+pacman -Sy --noconfirm
+
+# ── unmount anything on this disk ────────────────────────────────────────────
+log "Unmounting $DISK"
 umount -R "$MNT" 2>/dev/null || true
+# unmount any partition on this disk that might be mounted elsewhere
+for part in $(lsblk -lnpo NAME "$DISK" | tail -n +2); do
+  umount -R "$part" 2>/dev/null || true
+done
 swapoff -a 2>/dev/null || true
+
+# ── wipe + partition ─────────────────────────────────────────────────────────
+log "Wiping $DISK"
 wipefs -af "$DISK"
 sgdisk --zap-all "$DISK"
-sgdisk -n1:1MiB:+1GiB -t1:EF00 -c1:EFI \
-       -n2:0:0        -t2:8304 -c2:root "$DISK"
-partprobe "$DISK"
- udevadm settle
- sleep 3
- blockdev --rereadpt "$DISK" 2>/dev/null || true
- udevadm settle
- sleep 2
 
+log "Partitioning $DISK (GPT: 1G EFI + rest ext4)"
+sgdisk \
+  -n1:1MiB:+1GiB  -t1:EF00 -c1:EFI \
+  -n2:0:0          -t2:8300 -c2:root \
+  "$DISK"
+
+# ── force kernel to re-read the new partition table ──────────────────────────
+log "Re-reading partition table"
+# Try multiple methods — one of them will succeed on real hardware
+partprobe "$DISK"      2>/dev/null || true
+blockdev --rereadpt "$DISK" 2>/dev/null || true
+udevadm settle
+sleep 5   # give the kernel a moment to create the new block devices
+
+# Confirm the partitions actually exist before formatting
+[[ "$DISK" =~ (nvme|mmcblk) ]] && P="${DISK}p" || P="$DISK"
+[[ -b "${P}1" ]] || die "Partition ${P}1 did not appear — reboot the live ISO and retry"
+[[ -b "${P}2" ]] || die "Partition ${P}2 did not appear — reboot the live ISO and retry"
+
+# ── format ───────────────────────────────────────────────────────────────────
+log "Formatting EFI  ${P}1"
 mkfs.fat -F32 -n EFI "${P}1"
+
+log "Formatting root ${P}2"
 mkfs.ext4 -F -L archroot "${P}2"
 
-mount_target() {
-  mountpoint -q "$MNT"      || { mkdir -p "$MNT"; mount "${P}2" "$MNT"; }
-  mountpoint -q "$MNT/boot" || mount --mkdir "${P}1" "$MNT/boot"
-}
-mount_target
+# ── mount ────────────────────────────────────────────────────────────────────
+log "Mounting"
+mkdir -p "$MNT"
+mount "${P}2" "$MNT"
+mkdir -p "$MNT/boot"
+mount "${P}1" "$MNT/boot"
 
-# ---- archinstall ----
-log "Running archinstall"
-HASH_ROOT=$(openssl passwd -6 "$ROOT_PASS")
-HASH_USER=$(openssl passwd -6 "$USER_PASS")
-PKG_JSON=$(printf '"%s",' $PKGS); PKG_JSON="[${PKG_JSON%,}]"
+# ── install base system ──────────────────────────────────────────────────────
+log "Running pacstrap (this takes a few minutes)"
+pacstrap -K "$MNT" "${BASE_PKGS[@]}"
 
-cat > /root/user_configuration.json <<JSON
-{
-  "archinstall-language": "English",
-  "bootloader": "Grub",
-  "bootloader_config": { "bootloader": "Grub", "uki": false, "removable": true },
-  "disk_config": { "config_type": "pre_mounted_config", "mountpoint": "$MNT" },
-  "hostname": "$HOSTNAME",
-  "kernels": ["linux"],
-  "locale_config": { "kb_layout": "us", "sys_enc": "UTF-8", "sys_lang": "en_US" },
-  "network_config": { "type": "nm" },
-  "ntp": true,
-  "packages": $PKG_JSON,
-  "profile_config": null,
-  "swap": true,
-  "timezone": "$TIMEZONE",
-  "silent": true
-}
-JSON
+# ── fstab ────────────────────────────────────────────────────────────────────
+log "Generating fstab"
+genfstab -U "$MNT" > "$MNT/etc/fstab"
+cat "$MNT/etc/fstab"
 
-cat > /root/user_credentials.json <<JSON
-{
-  "root_enc_password": "$HASH_ROOT",
-  "users": [ { "username": "$USERNAME", "enc_password": "$HASH_USER", "sudo": true, "groups": [] } ]
-}
-JSON
-
-timeout 2400 archinstall \
-  --config /root/user_configuration.json \
-  --creds  /root/user_credentials.json \
-  --silent < /dev/null || log "archinstall exited non-zero — checking result"
-
-mount_target
-
-# ---- pacstrap fallback ----
-if [[ ! -f "$MNT/boot/vmlinuz-linux" || ! -x "$MNT/usr/bin/bash" ]]; then
-  log "archinstall did not finish — falling back to pacstrap"
-  pacstrap -K "$MNT" base linux linux-firmware grub $PKGS
-  arch-chroot "$MNT" /bin/bash -c "
-    ln -sf /usr/share/zoneinfo/$TIMEZONE /etc/localtime
-    hwclock --systohc
-    sed -i 's/^#en_US.UTF-8/en_US.UTF-8/' /etc/locale.gen
-    locale-gen
-    echo LANG=en_US.UTF-8 > /etc/locale.conf
-    echo KEYMAP=us > /etc/vconsole.conf
-  "
-fi
-
-echo "$HOSTNAME" > "$MNT/etc/hostname"
-grep -q '[[:space:]]/[[:space:]]' "$MNT/etc/fstab" 2>/dev/null \
-  || genfstab -U "$MNT" >> "$MNT/etc/fstab"
-
-# ---- users, services, bootloader ----
-log "Configuring users and bootloader"
+# ── chroot configuration ─────────────────────────────────────────────────────
+log "Configuring installed system"
 arch-chroot "$MNT" /bin/bash <<CHROOT
-set -x
-pacman -S --needed --noconfirm grub efibootmgr sudo networkmanager openssh git
-id $USERNAME &>/dev/null || useradd -m -G wheel -s /bin/bash $USERNAME
-usermod -aG wheel $USERNAME
-echo "root:$ROOT_PASS"      | chpasswd
-echo "$USERNAME:$USER_PASS" | chpasswd
-echo '%wheel ALL=(ALL:ALL) ALL' > /etc/sudoers.d/10-wheel
-chmod 440 /etc/sudoers.d/10-wheel
-echo "$USERNAME ALL=(ALL:ALL) NOPASSWD: ALL" > /etc/sudoers.d/20-$USERNAME-nopasswd
-chmod 440 /etc/sudoers.d/20-$USERNAME-nopasswd
-systemctl enable NetworkManager sshd
-grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=GRUB --removable
-grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=GRUB || true
+set -euo pipefail
+
+# timezone
+ln -sf /usr/share/zoneinfo/${TIMEZONE} /etc/localtime
+hwclock --systohc
+
+# locale
+sed -i "s/^#${LOCALE}/${LOCALE}/" /etc/locale.gen
+locale-gen
+echo "LANG=${LOCALE}" > /etc/locale.conf
+echo "KEYMAP=${KEYMAP}" > /etc/vconsole.conf
+
+# hostname
+echo "${HOSTNAME}" > /etc/hostname
+cat > /etc/hosts <<HOSTS
+127.0.0.1   localhost
+::1         localhost
+127.0.1.1   ${HOSTNAME}.localdomain ${HOSTNAME}
+HOSTS
+
+# users
+useradd -m -G wheel -s /bin/bash ${USERNAME} 2>/dev/null || true
+echo "root:${ROOT_PASS}"       | chpasswd
+echo "${USERNAME}:${USER_PASS}" | chpasswd
+
+# sudo
+echo '%wheel ALL=(ALL:ALL) ALL'                    > /etc/sudoers.d/10-wheel
+echo '${USERNAME} ALL=(ALL:ALL) NOPASSWD: ALL'     > /etc/sudoers.d/20-${USERNAME}-nopasswd
+chmod 440 /etc/sudoers.d/10-wheel /etc/sudoers.d/20-${USERNAME}-nopasswd
+
+# services
+systemctl enable NetworkManager
+systemctl enable sshd
+
+# GRUB (UEFI)
+grub-install \
+  --target=x86_64-efi \
+  --efi-directory=/boot \
+  --bootloader-id=GRUB \
+  --recheck
+# also install to removable path so the BIOS can always find it
+grub-install \
+  --target=x86_64-efi \
+  --efi-directory=/boot \
+  --bootloader-id=GRUB \
+  --removable \
+  --recheck || true
 grub-mkconfig -o /boot/grub/grub.cfg
-date > /etc/arch-autoinstalled
+
+echo "chroot config done — $(date)" > /etc/arch-autoinstalled
 CHROOT
 
-cp /root/autoinstall.log /root/*.json "$MNT/root/" 2>/dev/null || true
+# ── copy install log into new system ─────────────────────────────────────────
+cp /root/autoinstall.log "$MNT/root/autoinstall.log" 2>/dev/null || true
+
+# ── unmount and reboot ───────────────────────────────────────────────────────
+log "Unmounting"
 sync
 umount -R "$MNT"
 
-log "##### Install complete #####"
-log "Login: $USERNAME / $USER_PASS   root / $ROOT_PASS"
-sleep 3
+log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+log "Install complete!"
+log "  root   password: ${ROOT_PASS}"
+log "  ${USERNAME} password: ${USER_PASS}"
+log "  Remove the USB/ISO before the system reboots."
+log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+sleep 5
 systemctl reboot
